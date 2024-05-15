@@ -1,0 +1,532 @@
+---
+title: "STAT8406Project"
+format: pdf
+editor: visual
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+library(stringi)
+library(lubridate)
+library(maps)
+library(httr)
+library(jsonlite)
+library(stringr)
+library(car) 
+```
+
+# About the data
+
+My main dataset is from UCI on rental listings from various websites retrieved in December 2019. The downloaded zip file came with two CSV files-- one with 10k listings, and one with 100k listings. For the project, I focused on just the smaller dataset. I also merged in 2 other datasets-- population from Census Bureau, income from IRS
+
+The main question I wanted to explore is what factors impacted overall rent price. This is also why I merged in a couple other datasets, as I thought it would allow me to get a more complete picture.
+
+# Data Wrangling
+
+Note: for purposes of knitted file, the first few code chunks are not run (since they take a while). I exported the results to a CSV which is then loaded further down instead.
+
+## Load data
+
+I loaded in the data from the CSV file, and then transformed the time column so I could see when the listings were retrieved. This helped me determine what year I should look for when merging in other datasets.
+
+```{r, message=F}
+rent_data_10k = read_delim("data/apartments_for_rent_classified_10K.csv", delim=";")
+rent_data_10k = rent_data_10k %>% mutate(time = as_datetime(time))
+head(rent_data_10k)
+```
+
+## Merge in population and average income
+
+I used the Google Maps API to get zip codes for each listing based on latitude/longitude, since other datsets I was interested in merging in had zip codes. The R packages for zip codes were extremely slow, so I went with the API route.
+
+```{r, eval = FALSE}
+readRenviron(".env")
+get_zip = function(lat,lon) {
+  print(paste0(lat,",",lon))
+  api_key = Sys.getenv("API_KEY")
+  base_url = "https://maps.googleapis.com/maps/api/geocode/json?"
+  url = paste0(base_url,"latlng=",lat,",",lon,"&sensor=true&key=",api_key)
+  resp = GET(url)
+  resp_text = content(resp,as="text") 
+  json_df = fromJSON(resp_text)
+  results = json_df$results
+  if (length(results) == 0) {
+    return(NULL)
+  } 
+  address_pieces = results$address_components
+  max_idx = which.max(sapply(address_pieces, nrow))
+  address = address_pieces[[max_idx]]
+  postal_code = address %>% filter(types == "postal_code")
+  return(postal_code$long_name[1])
+}
+vectorized_get_zip = Vectorize(get_zip)
+rent_data_with_zip = rent_data_10k %>% mutate(
+  Zip_Code = vectorized_get_zip(latitude, longitude)
+)
+rent_data_with_zip = rent_data_with_zip %>% mutate(Zip_Code = as.character(Zip_Code))
+```
+
+Google Maps was able to get zip codes for the majority of listings, but some of them were still null. Luckily, it was only 18 it couldn't find, so I was able to manually set the zip codes based on what was given in the listing description.
+
+```{r, eval=FALSE}
+rent_data_no_zip = rent_data_with_zip %>% filter(is.na(Zip_Code) | Zip_Code == "NULL")
+rent_data_zip = rent_data_with_zip %>% filter(Zip_Code != "NULL" & !is.na(Zip_Code))
+# manually set zip since there's only 18 left
+zips = c(
+  "32003",
+  "08215",
+  "22041",
+  "22844",
+  "93035",
+  "97215",
+  "48035", 
+  "06118", 
+  "06118", 
+  "06118", 
+  "06118",
+  "06118",
+  "48035",
+  "06118",
+  "06118",
+  "06118",
+  "95391",
+  "48315"
+)
+rent_data_no_zip$Zip_Code = zips
+rent_data_with_all_zips = rbind(rent_data_zip, rent_data_no_zip)
+```
+
+Merge in income data based on zip code
+
+```{r, eval=FALSE}
+# https://www.irs.gov/statistics/soi-tax-stats-individual-income-tax-statistics-2019-zip-code-data-soi
+rent_data_with_income = rent_data_with_all_zips %>% left_join(
+  read_csv("data/19zpallnoagi.csv") %>% 
+    select("ZIPCODE", "A00100"),
+  by=c('Zip_Code'='ZIPCODE')
+) %>% 
+  mutate(agi=A00100) %>% 
+  select(-c(A00100))
+head(rent_data_with_income)
+```
+
+Merge in population data based on zip code
+
+```{r, eval=FALSE}
+# https://data.census.gov/table/DECENNIALDHC2020.P1?q=All%205-digit%20ZIP%20Code%20Tabulation%20Areas%20within%20United%20States%20Populations%20and%20People
+pop_data = read_csv("data/DECENNIALDHC2020.P1-Data.csv") %>% 
+  select(NAME, P1_001N) %>% 
+  slice(-1) %>% 
+  mutate(
+    zip = str_sub(NAME, start= -5),
+    population = P1_001N
+  ) %>% 
+  select(zip,population)
+head(pop_data)
+```
+
+Made the column names nicer and saved the new dataset to a csv, so that I wouldn't need to reload zip code data later
+
+```{r, eval=FALSE}
+final_rent_data = rent_data_with_income %>% left_join(pop_data, by=c("Zip_Code"="zip"))
+colnames(final_rent_data) = make.names(colnames(final_rent_data))
+write.csv(final_rent_data, file="final_rent_data.csv", row.names = FALSE)
+```
+
+Now we can work with it (and not rerun all the code from before)
+
+```{r}
+loaded_rent_data = read_csv("final_rent_data.csv")
+head(loaded_rent_data)
+```
+
+## Cleaning
+
+```{r, warning=F}
+rent_data = loaded_rent_data %>% 
+  mutate(
+    category=substr(
+      category,
+      stri_locate_last_fixed(category,"/")[1]+1,
+      length(category)
+    ),
+    bathrooms=ifelse(bathrooms == "null" | is.na(bathrooms), 0, as.numeric(bathrooms)),
+    bedrooms=as.numeric(bedrooms),
+    fee=(fee=="YES"),
+    pets_allowed=ifelse(pets_allowed=="None","null",pets_allowed),
+    region=case_when(
+      state %in% c("CT","ME","MA","NH","RI","VT")~"New England",
+      state %in% c("NJ","NY","PA")~"Middle Atlantic",
+      state %in% c("IL","IN","MI","OH","WI")~"East North Central",
+      state %in% c("IA","KS","MN","MO","NE","ND","SD")~"West North Central",
+      state %in% c("DE","FL","GA","MD","NC","SC","VA","DC","WV")~"South Atlantic",
+      state %in% c("AL","KY","MS","TN")~"East South Central",
+      state %in% c("AR","LA","OK","TX")~"West South Central",
+      state %in% c("AZ","CO","ID","MT","NV","NM","UT","WY")~"Mountain",
+      state %in% c("AK","CA","HI","OR","WA")~"Pacific",
+    ),
+    price=case_when(
+      price_type == "Weekly" ~ price*4.5,
+      .default=price
+    ),
+    has_photo = has_photo %in% c("Thumbnail", "Yes")
+  ) %>% 
+  filter(!is.na(region)) %>% 
+  select(
+    -c(
+      price_display, 
+      title, 
+      id, 
+      body, 
+      address, 
+      price_type, 
+      latitude, 
+      longitude, 
+      time,
+      Zip_Code,
+      source,
+      cityname,
+      state,
+      currency
+    )
+  )
+head(rent_data)
+```
+
+### Split amenities and pets in separate indicator columns
+
+```{r}
+# ChatGPT
+split_column = function(df, col) {
+  new_df = df %>%
+    mutate(id = row_number()) %>%
+    separate_rows(!!sym(col), sep = ",") %>%
+    mutate(value = TRUE) %>%
+    complete(id, !!sym(col), fill = list(value = FALSE)) %>%
+    pivot_wider(
+      names_from = !!sym(col), 
+      values_from = value, 
+      values_fill = list(value = FALSE)
+    ) %>%
+    select(-id, -null) %>% 
+    drop_na() 
+  return(new_df)
+}
+rent_data = split_column(rent_data, "amenities")
+rent_data = split_column(rent_data, "pets_allowed")
+```
+
+### Remove columns where there is only 1 unique value
+
+```{r}
+rent_data = rent_data %>% 
+  select(where(~ n_distinct(.) > 1))
+head(rent_data)
+```
+
+# Explore Data and Assumptions
+
+## Plots for variables of interest
+
+```{r}
+ggplot(data=rent_data) + geom_histogram(aes(x=price))
+```
+
+Data does not appear to be very normal
+
+```{r}
+ggplot(data=rent_data) + geom_point(aes(x=bedrooms, y=price))
+```
+
+A major outlier, may want to remove
+
+```{r}
+rent_data %>% filter(price > 50000) 
+```
+
+AGI is very high-- either high cost of living or data entry error. It is a large apartment as well however.
+
+## Assumptions and Conditions
+
+```{r}
+rent_data %>% 
+  select(
+    bathrooms, 
+    bedrooms,
+    square_feet,
+    agi,
+    population,
+    price
+  ) %>% 
+  pairs()
+```
+
+Lots of right-skewed relationships. Potentially linear but also appears to be a lot of influential points (especially when focusing on just the relationships with price)
+
+## Linear Regression Model
+
+```{r}
+rent_lm = lm(price ~ ., data=rent_data)
+summary(rent_lm)
+```
+
+```{r}
+rent_lm %>% plot()
+```
+
+Based on the first plot (residual vs fitted), there is reason to believe that there are influential points and a possible non-linear relationship. In addition, plot 2 (QQ) shows possible issues with the errors not being constant/normal
+
+```{r}
+vif(rent_lm)
+```
+
+All of the VIF's are pretty low. Cats and dogs are above 3, so that's something to take note of, but not high enough to be cause for concern
+
+```{r}
+rent_lm %>% avPlots(ask = F)
+```
+
+```{r}
+ggplot(data=rent_data) + geom_histogram(aes(x=log(price)))
+```
+
+Data looks significantly more normal
+
+## Influential points
+
+```{r}
+# https://stackoverflow.com/questions/70149293/error-in-view-cannot-coerce-class-infl-to-a-data-frame-issue-is-with-in
+infl = influence.measures(rent_lm)
+infl_df = as.data.frame(infl[["infmat"]]) %>%
+  dplyr::mutate(inf = ifelse(row_number() %in% unname(which(
+    apply(infl$is.inf, 1, any)
+  )), "*", ""))
+row_nums = which(infl_df$inf != "")
+length(row_nums)
+rent_data_no_infl = rent_data %>% slice(-row_nums) %>% select(where(~ n_distinct(.) > 1))
+rent_lm_no_infl = lm(price ~ ., data=rent_data_no_infl)
+summary(rent_lm_no_infl)
+```
+
+Difference in R-squareds after removing influential points (0.385 vs 0.56 is explained by the model). However there were 648 points removed, and as seen below, still violation of assumptions. We'll transform price and proceed.
+
+```{r}
+rent_lm_no_infl %>% plot()
+```
+
+## Transformation on y
+
+```{r}
+rent_data_log = rent_data %>% mutate(price = log(price))
+rent_log_lm = lm(price ~ ., data=rent_data_log)
+summary(rent_log_lm)
+```
+
+```{r}
+rent_log_lm %>% plot()
+```
+
+Assumptions are definitely closer to being met. A couple possible influential points but significantly more normal/constantly errors.
+
+Just for interest, I decided to look at influential points again. This time, there were 700+. I'll leave them in since our assumptions look closer to being met
+
+```{r}
+infl = influence.measures(rent_log_lm)
+infl_df = as.data.frame(infl[["infmat"]]) %>%
+  dplyr::mutate(inf = ifelse(row_number() %in% unname(which(
+    apply(infl$is.inf, 1, any)
+  )), "*", ""))
+row_nums = which(infl_df$inf != "")
+length(row_nums)
+rent_data_no_infl = rent_data_log %>% slice(-row_nums) %>% select(where(~ n_distinct(.) > 1))
+rent_lm_no_infl = lm(price ~ ., data=rent_data_no_infl)
+summary(rent_lm_no_infl)
+```
+
+```{r}
+rent_lm_no_infl %>% plot()
+```
+
+```{r}
+ggplot(data=rent_data_log) + geom_point(aes(x=bedrooms, y=price))
+```
+
+That one high point does still look influential after the transformation, but it is closer to the rest of the data points.
+
+```{r}
+rent_log_lm %>% avPlots(ask = F)
+```
+
+## Variable selection
+
+```{r}
+rent_lm_reduced = rent_log_lm %>% step(
+  direction = "both", 
+  scope = formula(rent_log_lm),
+  trace = 0
+)
+summary(rent_lm_reduced)
+```
+
+```{r}
+ggplot(data=rent_data_log) + geom_point(aes(x=square_feet, y=price, color=Fireplace))
+```
+
+It seems strange that fireplace is negative, so I decided to look at square footage since that might be an influence. There is one very large house. We'll remove that
+
+```{r}
+rent_data_log_reduced = rent_data_log %>% 
+  filter(square_feet <= 39000) %>% 
+  select(where(~ n_distinct(.) > 1))
+rent_lm_log_reduced = lm(price ~ ., data=rent_data_log_reduced)
+summary(rent_lm_log_reduced)
+```
+
+```{r}
+rent_lm_log_reduced %>% plot()
+```
+
+```{r}
+step_lm = rent_lm_log_reduced %>% step(
+  direction = "both", 
+  scope = formula(rent_lm_log_reduced),
+  trace = 0
+)
+summary(step_lm)
+```
+
+Interesting things:
+
+-   Dogs is not significant, but Cats is
+
+-   Which of the amenities were removed (Pool, Washer/Dryer, Clubhouse stood out)
+
+-   How some of the amentities (fireplace, refrigerator, tennis, etc) seem to bring the price *down* rather than up
+
+    -   Probably some relationship with the other amenities and/or aspects of a listing (square footage, etc) affecting the model
+
+```{r}
+step_lm %>% plot()
+```
+
+Some curving at the tails of the QQ-plot to take note of.
+
+```{r}
+ggplot(data=rent_data_log_reduced) + geom_point(aes(x=square_feet, y=price, color=Fireplace))
+```
+
+Still some outliers, probably making the "no fireplace" correlate with higher price/more square-footage
+
+## Quadratic/Cubic regression
+
+```{r}
+rent_data_reduced = rent_data_log_reduced %>% select(
+  price,
+  category,
+  bathrooms,
+  bedrooms,
+  has_photo,
+  square_feet,
+  agi,
+  population,
+  region,
+  AC,
+  Basketball, 
+  Dishwasher,
+  Doorman,
+  Elevator,
+  Fireplace,
+  `Garbage Disposal`, 
+  Gym,
+  `Hot Tub`,
+  `Internet Access`,
+  Luxury,
+  Parking, 
+  Playground,
+  Refrigerator,
+  Tennis,
+  View,
+  `Wood Floors`, 
+  Cats
+) %>% mutate(
+  bedrooms_sq = bedrooms^2,
+  bathrooms_sq = bathrooms^2,
+  square_feet_sq = square_feet^2,
+  agi_sq = agi^2,
+  population_sq = population^2,
+)
+quad_rent_lm = lm(price ~ ., data=rent_data_reduced)
+summary(quad_rent_lm)
+```
+
+Looks like all of these factors may be quadratic
+
+```{r}
+summary(quad_rent_lm %>% step(
+  direction = "both", 
+  scope = formula(quad_rent_lm),
+  trace = 0
+))
+```
+
+All of the previously-identified variables are still relevant
+
+```{r}
+summary(quad_rent_lm %>% step(
+  direction = "forward", 
+  scope = formula(quad_rent_lm),
+  trace = 1
+))
+```
+
+Looking at possible cubic terms as well. Square footage was the one that was still significant.
+
+```{r}
+rent_data_reduced = rent_data_reduced %>% mutate(
+  square_feet_cu = square_feet^3
+)
+cu_rent_lm = lm(price ~ ., data=rent_data_reduced)
+summary(cu_rent_lm)
+```
+
+```{r}
+summary(cu_rent_lm %>% step(
+  direction = "both", 
+  scope = formula(cu_rent_lm),
+  trace = 0
+))
+```
+
+```{r}
+vif(cu_rent_lm)
+```
+
+We have some more issues with multicollinearity, it appears
+
+# Summary
+
+The following variables are impactful
+
+-   Category (apartment/house/short-term)
+
+-   Bedrooms (quadratic)
+
+-   Bathrooms (quadratic)
+
+-   Square footage (cubic)
+
+-   Income (quadratic)
+
+-   Population (quadratic)
+
+-   Region
+
+-   If cats were allowed
+
+-   The following amenities: AC, Basketball, Dishwasher, Doorman, Elevator, Fireplace, Garbage disposal, Gym, Hot tub, Internet, Luxury, Parking, Playground, Fridge, Tennis, View, Wood floors
+
+Some surprising variables, like AC, fireplace, tennis, and basketball seem to have a negative relationship. If I had more time, I would explore all of these variables more to see if there is some multicollinearity that hasn't been caught, or some other explanation for these trends. I would also be interested in exploring the luxury variable more since I would expect it to have more of an impact, but maybe there is some correlation with the other amentities and luxury, depending on how "luxury" is defined
+
+It also appears that population, AGI, number of bedrooms, square footage, and region have a large impact on price, in addition to a subset of the amentities included in the dataset.
+
+Overall, while taking the log of price helped a lot with some of our assumptions/conditions, there still seems to be some problems that warrant further investigation. If I also had more time, I may look into using some other regression methods like Ridge or Lasso.
